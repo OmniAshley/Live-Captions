@@ -1,119 +1,150 @@
 
-from queue import Queue, Empty, Full
+import sys
 from threading import Thread
 from time import perf_counter
 
-import numpy as np
 import requests
 
-from audio.loopback import stream_system_audio
-from audio.windows import fixed_windows
+from audio.frames import stream_frames
+from audio.vad import SpeechSegmenter
+from asr.jobs import JobMailbox
 from asr.whisper_client import WhisperClient
 
 
-WINDOW_SECONDS = 3.0
-MAX_PENDING_WINDOWS = 2
-SILENCE_RMS = 0.002
+def clear_preview():
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\033[2K")
+        sys.stdout.flush()
 
 
-def recognition_worker(jobs: Queue):
+def recognition_worker(mailbox: JobMailbox):
     recognizer = WhisperClient(language="auto")
+    last_finalized_id = 0
 
     while True:
-        window = jobs.get()
+        clip = mailbox.receive()
 
-        if window is None:
+        if clip is None:
             break
 
-        # Skip extremely quiet audio.
-        samples = np.frombuffer(
-            window.pcm, dtype="<i2"
-        ).astype(np.float32)
-
-        rms = np.sqrt(
-            np.mean(samples * samples)
-        ) / 32768.0
-
-        if rms < SILENCE_RMS:
+        if (
+            clip.stage == "preview"
+            and clip.utterance_id <= last_finalized_id
+        ):
             continue
 
         started = perf_counter()
 
         try:
-            text = recognizer.transcribe(window)
+            text = recognizer.transcribe(clip)
 
-            inference_time = perf_counter() - started
-            lag = perf_counter() - window.captured_at
+        except (requests.RequestException, ValueError) as exc:
+            clear_preview()
+            print(f"\n[ASR ERROR] {exc}")
+            continue
+
+        finished = perf_counter()
+
+        inference_s = finished - started
+        audio_s = (clip.end_s - clip.start_s)
+
+        rtf = (
+            inference_s / audio_s
+            if audio_s > 0 else 0.0
+        )
+
+        # Approximate lag since the final audio frame
+        # was captured, not since the phrase began.
+        capture_lag_s = finished - clip.captured_at
+
+        if clip.stage == "preview":
+            if not text:
+                continue
+
+            if sys.stdout.isatty():
+                display = (
+                    text[:90] + "..."
+                    if len(text) > 90 else text
+                )
+                sys.stdout.write(
+                    "\r\033[2K"
+                    f"[PREVIEW #{clip.utterance_id}] "
+                    f"{display}"
+                )
+                sys.stdout.flush()
+
+            else:
+                print(
+                    f"[PREVIEW #{clip.utterance_id}] {text}"
+                )
+
+        else:
+            last_finalized_id = max(
+                last_finalized_id,
+                clip.utterance_id,
+            )
+
+            clear_preview()
 
             if text:
                 print(
-                    f"\n[{window.start_s:.1f}s - "
-                    f"{window.end_s:.1f}s] {text}"
+                    f"\n[FINAL #{clip.utterance_id}]"
+                    f" [{clip.start_s:.2f}-"
+                    f"{clip.end_s:.2f}s]"
                 )
-
+                print(f"  {text}")
                 print(
-                    f"  Inference: {inference_time:.2f}s"
-                    f" | Post-capture lag: {lag:.2f}s"
+                    f"  Inference: {inference_s:.2f}s"
+                    f" | RTF: {rtf:.2f}"
+                    f" | Lag after capture:"
+                    f" {capture_lag_s:.2f}s\n"
                 )
-
-        except (requests.RequestException, ValueError) as exc:
-            print(f"\n[ASR ERROR] {exc}")
 
 
 def main():
-    print("=" * 50)
-    print("LiveCaption V0.2 - Multilingual ASR")
-    print("=" * 50)
-    print("Engine: whisper.cpp")
-    print("Language: Automatic detection")
-    print(f"Audio window: {WINDOW_SECONDS}s")
+    print("=" * 55)
+    print("LiveCaption V0.2.1 - Low-Latency ASR")
+    print("=" * 55)
+    print("Environment: live-captions")
+    print("ASR engine: whisper.cpp")
+    print("Language: Auto")
+    print("Audio: 16 kHz / mono / 20 ms")
+    print("VAD: WebRTC")
     print("Press Ctrl+C to stop.\n")
 
-    jobs = Queue(maxsize=MAX_PENDING_WINDOWS)
+    segmenter = SpeechSegmenter()
+    mailbox = JobMailbox()
 
     worker = Thread(
         target=recognition_worker,
-        args=(jobs,),
+        args=(mailbox,),
         daemon=True,
+        name="WhisperWorker",
     )
 
     worker.start()
 
     try:
-        chunks = stream_system_audio()
-        windows = fixed_windows(
-            chunks, seconds=WINDOW_SECONDS
-        )
+        for frame in stream_frames():
+            events = segmenter.push(frame)
 
-        for window in windows:
-            try:
-                jobs.put_nowait(window)
-
-            except Full:
-                # Keep recent audio instead of accumulating lag.
-                try:
-                    jobs.get_nowait()
-                except Empty:
-                    pass
-
-                try:
-                    jobs.put_nowait(window)
-                except Full:
-                    pass
-
-                print(
-                    "\n[WARNING] Dropped an audio window "
-                    "to limit backlog."
-                )
+            for clip in events:
+                mailbox.submit(clip)
 
     except KeyboardInterrupt:
-        print("\nCapture stopped.")
+        print("\nStopping audio capture...")
 
     finally:
-        try:
-            jobs.put_nowait(None)
-        except Full:
-            pass
+        mailbox.close()
+
+        if mailbox.dropped_finals:
+            print(
+                "Warning: "
+                f"{mailbox.dropped_finals} final "
+                "segments were dropped."
+            )
+
+        print("LiveCaption stopped.")
 
 
 if __name__ == "__main__":
